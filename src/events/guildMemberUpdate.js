@@ -1,5 +1,6 @@
 import { Events } from 'discord.js';
 import { logEvent, EVENT_TYPES } from '../services/loggingService.js';
+import { handleMemberBoostUpdate } from '../services/boosterService.js';
 import { logger } from '../utils/logger.js';
 
 export default {
@@ -10,16 +11,23 @@ export default {
     try {
       if (!newMember.guild) return;
 
+      try {
+        const boosterResult = await handleMemberBoostUpdate(oldMember, newMember);
+        if (boosterResult?.sent) {
+          logger.info(`[Booster] Announcement sent for ${newMember.user.tag} in ${newMember.guild.name}`);
+        }
+      } catch (boosterError) {
+        logger.warn('[Booster] Error while handling member boost update:', boosterError);
+      }
+
       const fields = [];
 
-      
       fields.push({
         name: '👤 Member',
         value: `${newMember.user.tag} (${newMember.user.id})`,
         inline: true
       });
 
-      
       if (oldMember.nickname !== newMember.nickname) {
         fields.push({
           name: '🏷️ Old Nickname',
