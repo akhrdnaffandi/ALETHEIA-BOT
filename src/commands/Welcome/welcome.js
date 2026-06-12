@@ -1,332 +1,372 @@
-import { getColor } from '../../config/bot.js';
 import {
     SlashCommandBuilder,
     PermissionFlagsBits,
     ChannelType,
-    EmbedBuilder,
-    MessageFlags
+    MessageFlags,
+    EmbedBuilder
 } from 'discord.js';
-import { errorEmbed } from '../../utils/embeds.js';
+import { errorEmbed, successEmbed } from '../../utils/embeds.js';
 import { getWelcomeConfig, updateWelcomeConfig } from '../../utils/database.js';
-import { formatWelcomeMessage } from '../../utils/welcome.js';
 import { logger } from '../../utils/logger.js';
 import { InteractionHelper } from '../../utils/interactionHelper.js';
 import {
-    buildBoosterConfigSummary,
-    getBoosterConfig,
-    sendBoosterAnnouncement,
-    updateBoosterConfig,
-    validateBoosterImageUrl
-} from '../../services/boosterService.js';
+    CUSTOM_MESSAGE_TYPES,
+    buildEmbedConfigFromOptions,
+    buildLifecyclePayload,
+    buildConfigSummaryEmbed,
+    resolveUploadedImage,
+    getDefaultCustomConfig
+} from '../../services/customMessageService.js';
 
-const BOOSTER_MESSAGE_HELP = 'Variables: {user}, {username}, {user.tag}, {server}, {boostCount}, {boostLevel}, {memberCount}';
-const DEFAULT_BOOSTER_MESSAGE = '✨ Terima kasih {user} sudah boost **{server}**! Sekarang server punya **{boostCount} boost** dan berada di **Level {boostLevel}**.';
+function addCommonCustomOptions(subcommand, { requireMessage = true, includeRewardRole = false } = {}) {
+    subcommand
+        .addChannelOption(option =>
+            option.setName('channel')
+                .setDescription('Channel tujuan pesan')
+                .addChannelTypes(ChannelType.GuildText)
+                .setRequired(true))
+        .addStringOption(option =>
+            option.setName('message')
+                .setDescription('Isi pesan. Variable: {user}, {server}, {memberCount}, {boostCount}, {boostLevel}')
+                .setMaxLength(2000)
+                .setRequired(requireMessage))
+        .addStringOption(option =>
+            option.setName('title')
+                .setDescription('Judul embed')
+                .setMaxLength(256)
+                .setRequired(false))
+        .addStringOption(option =>
+            option.setName('footer')
+                .setDescription('Footer embed')
+                .setMaxLength(2048)
+                .setRequired(false))
+        .addStringOption(option =>
+            option.setName('color')
+                .setDescription('Warna embed, contoh: #57F287, success, error, info')
+                .setMaxLength(32)
+                .setRequired(false))
+        .addStringOption(option =>
+            option.setName('image_url')
+                .setDescription('URL gambar/banner embed')
+                .setRequired(false))
+        .addAttachmentOption(option =>
+            option.setName('image_file')
+                .setDescription('Upload gambar/banner langsung dari galeri')
+                .setRequired(false))
+        .addStringOption(option =>
+            option.setName('thumbnail')
+                .setDescription('Thumbnail embed')
+                .addChoices(
+                    { name: 'Avatar user', value: 'user' },
+                    { name: 'Icon server', value: 'server' },
+                    { name: 'Custom URL', value: 'custom' },
+                    { name: 'Tidak pakai thumbnail', value: 'none' }
+                )
+                .setRequired(false))
+        .addStringOption(option =>
+            option.setName('thumbnail_url')
+                .setDescription('URL thumbnail jika thumbnail = Custom URL')
+                .setRequired(false))
+        .addBooleanOption(option =>
+            option.setName('ping')
+                .setDescription('Ping user di luar embed?')
+                .setRequired(false))
+        .addStringOption(option =>
+            option.setName('fields')
+                .setDescription('Field tambahan. Format: Judul=Isi; Judul 2=Isi 2')
+                .setMaxLength(1500)
+                .setRequired(false));
 
-function isHexColor(color) {
-    return /^#[0-9A-F]{6}$/i.test(color || '');
+    if (includeRewardRole) {
+        subcommand.addRoleOption(option =>
+            option.setName('reward_role')
+                .setDescription('Role bonus yang diberikan ketika member boost')
+                .setRequired(false));
+    }
+
+    return subcommand;
 }
 
-async function getMemberFromOption(interaction, optionName = 'user') {
-    const member = interaction.options.getMember(optionName);
-    if (member) return member;
+function makePreviewPayload(type, storedConfig, interaction, forceNoPing = true) {
+    return buildLifecyclePayload(type, storedConfig, {
+        user: interaction.user,
+        guild: interaction.guild,
+        member: interaction.member,
+        extra: {
+            boostCount: interaction.guild?.premiumSubscriptionCount || 0,
+            boostLevel: interaction.guild?.premiumTier || 0
+        }
+    }, { forceNoPing });
+}
 
-    const user = interaction.options.getUser(optionName);
-    if (!user) return interaction.member;
+function setupEmbedConfig(options, type) {
+    return buildEmbedConfigFromOptions(options, getDefaultCustomConfig(type));
+}
 
-    return await interaction.guild.members.fetch(user.id).catch(() => interaction.member);
+function configItems(config, type) {
+    if (type === CUSTOM_MESSAGE_TYPES.BOOSTER) {
+        return [
+            { name: 'Status', value: config.boosterEnabled ? '✅ Aktif' : '❌ Nonaktif', inline: true },
+            { name: 'Channel', value: config.boosterChannelId ? `<#${config.boosterChannelId}>` : '`Belum diset`', inline: true },
+            { name: 'Ping', value: config.boosterPing ? '✅ Ya' : '❌ Tidak', inline: true },
+            { name: 'Reward Role', value: config.boosterRewardRoleId ? `<@&${config.boosterRewardRoleId}>` : '`Tidak ada`', inline: true },
+            { name: 'Title', value: config.boosterEmbed?.title || '`Default`', inline: false },
+            { name: 'Image', value: config.boosterEmbed?.image ? '✅ Ada' : '❌ Tidak ada', inline: true },
+            { name: 'Footer', value: config.boosterEmbed?.footer || '`Default`', inline: false }
+        ];
+    }
+
+    return [
+        { name: 'Status', value: config.enabled ? '✅ Aktif' : '❌ Nonaktif', inline: true },
+        { name: 'Channel', value: config.channelId ? `<#${config.channelId}>` : '`Belum diset`', inline: true },
+        { name: 'Ping', value: config.welcomePing ? '✅ Ya' : '❌ Tidak', inline: true },
+        { name: 'Title', value: config.welcomeEmbed?.title || '`Default`', inline: false },
+        { name: 'Image', value: config.welcomeEmbed?.image || config.welcomeImage ? '✅ Ada' : '❌ Tidak ada', inline: true },
+        { name: 'Footer', value: config.welcomeEmbed?.footer || '`Default`', inline: false }
+    ];
 }
 
 export default {
     data: new SlashCommandBuilder()
         .setName('welcome')
-        .setDescription('Configure the welcome and booster welcome system')
+        .setDescription('Configure welcome and server booster messages')
         .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+        .addSubcommand(subcommand => addCommonCustomOptions(
+            subcommand.setName('setup').setDescription('Setup welcome message full custom'),
+            { requireMessage: true }
+        ))
         .addSubcommand(subcommand =>
             subcommand
-                .setName('setup')
-                .setDescription('Set up the welcome message')
-                .addChannelOption(option =>
-                    option.setName('channel')
-                        .setDescription('The channel to send welcome messages to')
-                        .addChannelTypes(ChannelType.GuildText)
-                        .setRequired(true))
+                .setName('image')
+                .setDescription('Menu upload gambar langsung dari galeri untuk welcome/booster')
                 .addStringOption(option =>
-                    option.setName('message')
-                        .setDescription('Welcome message. Variables: {user}, {username}, {server}, {memberCount}')
+                    option.setName('type')
+                        .setDescription('Jenis pesan yang gambarnya mau diganti')
+                        .addChoices(
+                            { name: 'Welcome', value: 'welcome' },
+                            { name: 'Booster', value: 'booster' }
+                        )
                         .setRequired(true))
+                .addAttachmentOption(option =>
+                    option.setName('image_file')
+                        .setDescription('Upload gambar dari galeri')
+                        .setRequired(true)))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('preview')
+                .setDescription('Preview tampilan welcome/booster')
                 .addStringOption(option =>
-                    option.setName('image')
-                        .setDescription('URL of the image to include in the welcome message')
-                        .setRequired(false))
-                .addBooleanOption(option =>
-                    option.setName('ping')
-                        .setDescription('Whether to ping the user in the welcome message')
+                    option.setName('type')
+                        .setDescription('Jenis pesan')
+                        .addChoices(
+                            { name: 'Welcome', value: 'welcome' },
+                            { name: 'Booster', value: 'booster' }
+                        )
                         .setRequired(false)))
         .addSubcommand(subcommand =>
             subcommand
-                .setName('booster-setup')
-                .setDescription('Set channel and message for server booster welcome')
-                .addChannelOption(option =>
-                    option.setName('channel')
-                        .setDescription('Channel untuk pesan server booster')
-                        .addChannelTypes(ChannelType.GuildText)
-                        .setRequired(true))
-                .addStringOption(option =>
-                    option.setName('message')
-                        .setDescription(BOOSTER_MESSAGE_HELP)
-                        .setMaxLength(1500)
-                        .setRequired(false))
-                .addStringOption(option =>
-                    option.setName('image')
-                        .setDescription('Optional URL gambar/banner custom untuk booster welcome')
-                        .setRequired(false))
-                .addBooleanOption(option =>
-                    option.setName('ping')
-                        .setDescription('Ping member yang boost server?')
-                        .setRequired(false))
-                .addBooleanOption(option =>
-                    option.setName('visual')
-                        .setDescription('Tampilkan visual booster otomatis jika tidak pakai image custom?')
-                        .setRequired(false))
-                .addRoleOption(option =>
-                    option.setName('reward_role')
-                        .setDescription('Optional role reward yang diberikan ke booster')
-                        .setRequired(false))
-                .addStringOption(option =>
-                    option.setName('color')
-                        .setDescription('Warna embed HEX, contoh: #F47FFF')
-                        .setRequired(false)))
+                .setName('config')
+                .setDescription('Lihat konfigurasi welcome'))
         .addSubcommand(subcommand =>
             subcommand
-                .setName('booster-disable')
-                .setDescription('Disable server booster welcome'))
-        .addSubcommand(subcommand =>
-            subcommand
-                .setName('booster-config')
-                .setDescription('Show current server booster welcome config'))
+                .setName('disable')
+                .setDescription('Matikan welcome message'))
+        .addSubcommand(subcommand => addCommonCustomOptions(
+            subcommand.setName('booster-setup').setDescription('Setup booster welcome full custom'),
+            { requireMessage: false, includeRewardRole: true }
+        ))
         .addSubcommand(subcommand =>
             subcommand
                 .setName('booster-test')
-                .setDescription('Send a test server booster welcome message')
-                .addUserOption(option =>
-                    option.setName('user')
-                        .setDescription('User yang dipakai untuk preview/test')
-                        .setRequired(false))),
+                .setDescription('Test kirim booster welcome ke channel yang diset'))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('booster-config')
+                .setDescription('Lihat konfigurasi booster welcome'))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('booster-disable')
+                .setDescription('Matikan booster welcome')),
 
     async execute(interaction) {
-        try {
-            const deferSuccess = await InteractionHelper.safeDefer(interaction, { flags: MessageFlags.Ephemeral });
-            if (!deferSuccess) {
-                logger.warn('Welcome interaction defer failed', {
-                    userId: interaction.user.id,
-                    guildId: interaction.guildId,
-                    commandName: 'welcome'
-                });
-                return;
-            }
-        } catch (deferError) {
-            logger.error('Welcome defer error', { error: deferError.message });
-            return;
-        }
+        const deferred = await InteractionHelper.safeDefer(interaction, { flags: MessageFlags.Ephemeral });
+        if (!deferred) return;
 
         const { options, guild, client } = interaction;
 
         if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
             return await InteractionHelper.safeEditReply(interaction, {
-                embeds: [errorEmbed('Missing Permissions', 'You need the **Manage Server** permission to use `/welcome`.')],
-                flags: MessageFlags.Ephemeral
+                embeds: [errorEmbed('Missing Permissions', 'You need the **Manage Server** permission to use `/welcome`.')]
             });
         }
 
         const subcommand = options.getSubcommand();
 
-        if (subcommand === 'setup') {
-            return await handleWelcomeSetup(interaction);
-        }
-
-        if (subcommand === 'booster-setup') {
-            const channel = options.getChannel('channel');
-            const message = options.getString('message') || DEFAULT_BOOSTER_MESSAGE;
-            const image = options.getString('image');
-            const ping = options.getBoolean('ping') ?? true;
-            const showVisual = options.getBoolean('visual') ?? true;
-            const rewardRole = options.getRole('reward_role');
-            const color = options.getString('color') || '#F47FFF';
-
-            if (!message || message.trim().length === 0) {
-                return await InteractionHelper.safeEditReply(interaction, {
-                    embeds: [errorEmbed('Invalid Input', 'Booster message tidak boleh kosong.')]
-                });
+        try {
+            switch (subcommand) {
+                case 'setup':
+                    return await handleWelcomeSetup(interaction, client, guild);
+                case 'image':
+                    return await handleImageUpload(interaction, client, guild);
+                case 'preview':
+                    return await handlePreview(interaction, client, guild);
+                case 'config':
+                    return await handleConfig(interaction, client, guild, CUSTOM_MESSAGE_TYPES.WELCOME);
+                case 'disable':
+                    return await handleDisable(interaction, client, guild, CUSTOM_MESSAGE_TYPES.WELCOME);
+                case 'booster-setup':
+                    return await handleBoosterSetup(interaction, client, guild);
+                case 'booster-test':
+                    return await handleBoosterTest(interaction, client, guild);
+                case 'booster-config':
+                    return await handleConfig(interaction, client, guild, CUSTOM_MESSAGE_TYPES.BOOSTER);
+                case 'booster-disable':
+                    return await handleDisable(interaction, client, guild, CUSTOM_MESSAGE_TYPES.BOOSTER);
+                default:
+                    return await InteractionHelper.safeEditReply(interaction, {
+                        embeds: [errorEmbed('Unknown Subcommand', 'Subcommand tidak dikenali.')]
+                    });
             }
-
-            if (image && !validateBoosterImageUrl(image)) {
-                return await InteractionHelper.safeEditReply(interaction, {
-                    embeds: [errorEmbed('Invalid Image URL', 'Gunakan URL gambar publik yang valid, contoh `https://.../banner.png`.')]
-                });
-            }
-
-            if (!isHexColor(color)) {
-                return await InteractionHelper.safeEditReply(interaction, {
-                    embeds: [errorEmbed('Invalid Color', 'Format warna harus HEX, contoh `#F47FFF`.')]
-                });
-            }
-
-            const config = await updateBoosterConfig(client, guild.id, {
-                enabled: true,
-                channelId: channel.id,
-                message,
-                image: image || null,
-                ping,
-                showVisual,
-                rewardRoleId: rewardRole?.id ?? null,
-                color,
-                setupBy: interaction.user.id,
-                setupAt: new Date().toISOString()
+        } catch (error) {
+            logger.error(`[Welcome Custom] ${subcommand} failed`, error);
+            return await InteractionHelper.safeEditReply(interaction, {
+                embeds: [errorEmbed('Setup Failed', error.message || 'Terjadi error saat menyimpan konfigurasi.')]
             });
-
-            const embed = new EmbedBuilder()
-                .setColor(color)
-                .setTitle('💎 Booster Welcome Configured')
-                .setDescription(`Pesan server booster akan dikirim ke ${channel}.`)
-                .addFields(
-                    { name: 'Preview Message', value: message },
-                    { name: 'Config', value: buildBoosterConfigSummary(config) }
-                )
-                .setFooter({ text: 'Gunakan /welcome booster-test untuk cek tampilannya.' })
-                .setTimestamp();
-
-            if (image) embed.setImage(image);
-
-            return await InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
         }
-
-        if (subcommand === 'booster-disable') {
-            const config = await updateBoosterConfig(client, guild.id, { enabled: false });
-            const embed = new EmbedBuilder()
-                .setColor(getColor('warning'))
-                .setTitle('💎 Booster Welcome Disabled')
-                .setDescription('Pesan server booster sudah dinonaktifkan.')
-                .addFields({ name: 'Config', value: buildBoosterConfigSummary(config) })
-                .setTimestamp();
-
-            return await InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
-        }
-
-        if (subcommand === 'booster-config') {
-            const config = await getBoosterConfig(client, guild.id);
-            const embed = new EmbedBuilder()
-                .setColor(config.color || '#F47FFF')
-                .setTitle('💎 Booster Welcome Config')
-                .setDescription(buildBoosterConfigSummary(config))
-                .addFields({ name: 'Message', value: config.message || DEFAULT_BOOSTER_MESSAGE })
-                .setTimestamp();
-
-            if (config.image) embed.setImage(config.image);
-
-            return await InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
-        }
-
-        if (subcommand === 'booster-test') {
-            const config = await getBoosterConfig(client, guild.id);
-            if (!config.channelId) {
-                return await InteractionHelper.safeEditReply(interaction, {
-                    embeds: [errorEmbed('Booster Welcome Belum Diset', 'Jalankan dulu `/welcome booster-setup`.')]
-                });
-            }
-
-            const member = await getMemberFromOption(interaction, 'user');
-            const result = await sendBoosterAnnouncement(member, { force: true, test: true });
-
-            const success = result.sent;
-            const embed = new EmbedBuilder()
-                .setColor(success ? getColor('success') : getColor('error'))
-                .setTitle(success ? '✅ Booster Test Sent' : '❌ Booster Test Failed')
-                .setDescription(success
-                    ? `Preview berhasil dikirim ke <#${config.channelId}>.`
-                    : `Gagal mengirim preview. Reason: **${result.reason || 'unknown'}**`)
-                .setTimestamp();
-
-            return await InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
-        }
-    }
+    },
 };
 
-async function handleWelcomeSetup(interaction) {
-    const { options, guild, client } = interaction;
-    const channel = options.getChannel('channel');
-    const message = options.getString('message');
-    const image = options.getString('image');
-    const ping = options.getBoolean('ping') ?? false;
+async function handleWelcomeSetup(interaction, client, guild) {
+    const channel = interaction.options.getChannel('channel');
+    const message = interaction.options.getString('message');
+    const ping = interaction.options.getBoolean('ping') ?? false;
+    const embedConfig = setupEmbedConfig(interaction.options, CUSTOM_MESSAGE_TYPES.WELCOME);
+    embedConfig.description = message;
 
-    const existingConfig = await getWelcomeConfig(client, guild.id);
-    if (existingConfig?.channelId) {
-        logger.info(`[Welcome] Setup blocked because config already exists in channel ${existingConfig.channelId} for guild ${guild.id}`);
+    const updated = await updateWelcomeConfig(client, guild.id, {
+        enabled: true,
+        channelId: channel.id,
+        welcomeMessage: message,
+        welcomePing: ping,
+        welcomeImage: embedConfig.image || null,
+        welcomeEmbed: embedConfig,
+        setupBy: interaction.user.id,
+        setupAt: new Date().toISOString()
+    });
+
+    const preview = makePreviewPayload(CUSTOM_MESSAGE_TYPES.WELCOME, updated, interaction);
+    preview.embeds = [new EmbedBuilder(preview.embeds?.[0]?.data || {})
+        .setTitle(`✅ Welcome Configured — ${embedConfig.title || 'Preview'}`)];
+
+    await InteractionHelper.safeEditReply(interaction, {
+        content: `Welcome akan dikirim ke ${channel}.`,
+        embeds: preview.embeds
+    });
+}
+
+async function handleBoosterSetup(interaction, client, guild) {
+    const channel = interaction.options.getChannel('channel');
+    const ping = interaction.options.getBoolean('ping') ?? false;
+    const rewardRole = interaction.options.getRole('reward_role');
+    const embedConfig = setupEmbedConfig(interaction.options, CUSTOM_MESSAGE_TYPES.BOOSTER);
+
+    const updated = await updateWelcomeConfig(client, guild.id, {
+        boosterEnabled: true,
+        boosterChannelId: channel.id,
+        boosterMessage: embedConfig.description,
+        boosterPing: ping,
+        boosterRewardRoleId: rewardRole?.id || null,
+        boosterImage: embedConfig.image || null,
+        boosterEmbed: embedConfig,
+        boosterSetupBy: interaction.user.id,
+        boosterSetupAt: new Date().toISOString()
+    });
+
+    const preview = makePreviewPayload(CUSTOM_MESSAGE_TYPES.BOOSTER, updated, interaction);
+    await InteractionHelper.safeEditReply(interaction, {
+        content: `Booster welcome akan dikirim ke ${channel}.${rewardRole ? ` Reward role: ${rewardRole}` : ''}`,
+        embeds: preview.embeds
+    });
+}
+
+async function handleImageUpload(interaction, client, guild) {
+    const type = interaction.options.getString('type') || CUSTOM_MESSAGE_TYPES.WELCOME;
+    const imageUrl = resolveUploadedImage(interaction.options.getAttachment('image_file'));
+    if (!imageUrl) {
         return await InteractionHelper.safeEditReply(interaction, {
-            embeds: [errorEmbed(
-                'Welcome Setup Already Exists',
-                `Welcome is already configured for <#${existingConfig.channelId}>. Use **/welcome config** to customize channel, message, ping, or image.`
-            )]
+            embeds: [errorEmbed('Invalid Image', 'File yang diupload tidak bisa dipakai sebagai gambar.')]
         });
     }
 
-    if (!message || message.trim().length === 0) {
-        logger.warn(`[Welcome] Empty message provided by ${interaction.user.tag} in ${guild.name}`);
-        return await InteractionHelper.safeEditReply(interaction, {
-            embeds: [errorEmbed('Invalid Input', 'Welcome message cannot be empty')]
-        });
-    }
-
-    if (image) {
-        try {
-            new URL(image);
-        } catch (e) {
-            logger.warn(`[Welcome] Invalid image URL provided by ${interaction.user.tag}: ${image}`);
-            return await InteractionHelper.safeEditReply(interaction, {
-                embeds: [errorEmbed('Invalid Image URL', 'Please provide a valid image URL (must start with http:// or https://)')]
-            });
-        }
-    }
-
-    try {
+    const current = await getWelcomeConfig(client, guild.id);
+    if (type === CUSTOM_MESSAGE_TYPES.BOOSTER) {
         await updateWelcomeConfig(client, guild.id, {
-            enabled: true,
-            channelId: channel.id,
-            welcomeMessage: message,
-            welcomeImage: image || undefined,
-            welcomePing: ping
+            boosterImage: imageUrl,
+            boosterEmbed: { ...(current.boosterEmbed || getDefaultCustomConfig(CUSTOM_MESSAGE_TYPES.BOOSTER)), image: imageUrl }
         });
-
-        logger.info(`[Welcome] Setup configured by ${interaction.user.tag} for guild ${guild.name} (${guild.id})`);
-
-        const previewMessage = formatWelcomeMessage(message, {
-            user: interaction.user,
-            guild
-        });
-
-        const embed = new EmbedBuilder()
-            .setColor(getColor('success'))
-            .setTitle('✅ Welcome System Configured')
-            .setDescription(`Welcome messages will now be sent to ${channel}`)
-            .addFields(
-                { name: 'Message Preview', value: previewMessage },
-                { name: 'Ping User', value: ping ? '✅ Yes' : '❌ No' },
-                { name: 'Status', value: '✅ Enabled' }
-            )
-            .setFooter({ text: 'Tip: Use /welcome config to customize welcome settings' });
-
-        if (image) {
-            embed.setImage(image);
-        }
-
-        await InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
-    } catch (error) {
-        logger.error(`[Welcome] Failed to setup welcome system for guild ${guild.id}:`, error);
-        await InteractionHelper.safeEditReply(interaction, {
-            embeds: [errorEmbed(
-                'Setup Failed',
-                'An error occurred while configuring the welcome system. Please try again.',
-                { showDetails: true }
-            )]
+    } else {
+        await updateWelcomeConfig(client, guild.id, {
+            welcomeImage: imageUrl,
+            welcomeEmbed: { ...(current.welcomeEmbed || getDefaultCustomConfig(CUSTOM_MESSAGE_TYPES.WELCOME)), image: imageUrl }
         });
     }
+
+    const label = type === CUSTOM_MESSAGE_TYPES.BOOSTER ? 'Booster' : 'Welcome';
+    await InteractionHelper.safeEditReply(interaction, {
+        embeds: [successEmbed(`Gambar **${label}** berhasil diganti dari upload galeri.`, '✅ Image Updated')]
+    });
+}
+
+async function handlePreview(interaction, client, guild) {
+    const type = interaction.options.getString('type') || CUSTOM_MESSAGE_TYPES.WELCOME;
+    const config = await getWelcomeConfig(client, guild.id);
+    const payload = makePreviewPayload(type, config, interaction);
+    await InteractionHelper.safeEditReply(interaction, {
+        content: `Preview **${type}**:`,
+        embeds: payload.embeds
+    });
+}
+
+async function handleConfig(interaction, client, guild, type) {
+    const config = await getWelcomeConfig(client, guild.id);
+    const title = type === CUSTOM_MESSAGE_TYPES.BOOSTER ? '💎 Booster Welcome Config' : '🎉 Welcome Config';
+    await InteractionHelper.safeEditReply(interaction, {
+        embeds: [buildConfigSummaryEmbed(title, configItems(config, type), 'info')]
+    });
+}
+
+async function handleDisable(interaction, client, guild, type) {
+    if (type === CUSTOM_MESSAGE_TYPES.BOOSTER) {
+        await updateWelcomeConfig(client, guild.id, { boosterEnabled: false });
+        return await InteractionHelper.safeEditReply(interaction, {
+            embeds: [successEmbed('Booster welcome berhasil dimatikan.', '✅ Booster Disabled')]
+        });
+    }
+
+    await updateWelcomeConfig(client, guild.id, { enabled: false });
+    return await InteractionHelper.safeEditReply(interaction, {
+        embeds: [successEmbed('Welcome message berhasil dimatikan.', '✅ Welcome Disabled')]
+    });
+}
+
+async function handleBoosterTest(interaction, client, guild) {
+    const config = await getWelcomeConfig(client, guild.id);
+    if (!config.boosterChannelId) {
+        return await InteractionHelper.safeEditReply(interaction, {
+            embeds: [errorEmbed('Booster belum diset', 'Gunakan `/welcome booster-setup` dulu.')]
+        });
+    }
+
+    const channel = guild.channels.cache.get(config.boosterChannelId);
+    if (!channel?.isTextBased?.()) {
+        return await InteractionHelper.safeEditReply(interaction, {
+            embeds: [errorEmbed('Channel tidak valid', 'Channel booster tidak ditemukan atau bukan text channel.')]
+        });
+    }
+
+    const payload = makePreviewPayload(CUSTOM_MESSAGE_TYPES.BOOSTER, config, interaction, true);
+    await channel.send(payload);
+    return await InteractionHelper.safeEditReply(interaction, {
+        embeds: [successEmbed(`Test booster welcome berhasil dikirim ke ${channel}.`, '✅ Booster Test Sent')]
+    });
 }
