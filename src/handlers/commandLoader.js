@@ -8,6 +8,29 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 
+// Discord only allows up to 100 guild slash commands.
+// The project has grown past that limit after adding game/premium/custom modules.
+// These legacy/less-used commands are skipped by default so important setup commands
+// like /welcome, /goodbye, and /verification are always registered.
+// Override from .env if needed, example:
+// DISABLED_COMMANDS=greet,slut,overview
+const DEFAULT_DISABLED_COMMANDS = ['greet', 'slut'];
+
+function getDisabledCommands() {
+    const raw = process.env.DISABLED_COMMANDS;
+    const list = raw && raw.trim()
+        ? raw.split(',')
+        : DEFAULT_DISABLED_COMMANDS;
+
+    return new Set(
+        list
+            .map(name => String(name || '').trim().toLowerCase())
+            .filter(Boolean)
+    );
+}
+
+
+
 
 
 
@@ -93,6 +116,12 @@ export async function loadCommands(client) {
             command.filePath = normalizedPath;
             
             const primaryCommandName = command.data.name;
+            const disabledCommands = getDisabledCommands();
+
+            if (disabledCommands.has(String(primaryCommandName).toLowerCase())) {
+                logger.warn(`Skipping disabled command: ${primaryCommandName} from ${normalizedPath}`);
+                continue;
+            }
             
             if (!uniqueCommandNames.has(primaryCommandName)) {
                 uniqueCommandNames.add(primaryCommandName);
