@@ -1,135 +1,115 @@
 import { SlashCommandBuilder } from 'discord.js';
-import { createEmbed, errorEmbed, successEmbed, infoEmbed, warningEmbed } from '../../utils/embeds.js';
-import { getEconomyData, setEconomyData } from '../../utils/economy.js';
-import { withErrorHandling, createError, ErrorTypes } from '../../utils/errorHandler.js';
-import { MessageTemplates } from '../../utils/messageTemplates.js';
+import { createEmbed, errorEmbed, successEmbed } from '../../utils/embeds.js';
 import { InteractionHelper } from '../../utils/interactionHelper.js';
+import { logger } from '../../utils/logger.js';
+import GamePackService from '../../services/gamePackService.js';
 
-const FISH_COOLDOWN = 45 * 60 * 1000; 
-const BASE_MIN_REWARD = 300;
-const BASE_MAX_REWARD = 900;
-const FISHING_ROD_MULTIPLIER = 1.5;
+const money = (amount) => GamePackService.money(amount);
 
-const FISH_TYPES = [
-    { name: 'Bass', emoji: '🐟', rarity: 'common' },
-    { name: 'Salmon', emoji: '🐟', rarity: 'common' },
-    { name: 'Trout', emoji: '🐟', rarity: 'common' },
-    { name: 'Tuna', emoji: '🐟', rarity: 'uncommon' },
-    { name: 'Swordfish', emoji: '🐟', rarity: 'uncommon' },
-    { name: 'Octopus', emoji: '🐙', rarity: 'rare' },
-    { name: 'Lobster', emoji: '🦞', rarity: 'rare' },
-    { name: 'Shark', emoji: '🦈', rarity: 'epic' },
-    { name: 'Whale', emoji: '🐋', rarity: 'legendary' },
-];
+async function replyError(interaction, message) {
+  return InteractionHelper.safeEditReply(interaction, { embeds: [errorEmbed(message)] });
+}
 
-const CATCH_MESSAGES = [
-    "You cast your line into the crystal clear waters...",
-    "You wait patiently as your bobber floats...",
-    "After a few minutes of waiting, you feel a tug...",
-    "The water ripples as something takes your bait...",
-    "You reel in your catch with expert precision...",
-];
+function leaderboardText(rows) {
+  if (!rows.length) return 'Belum ada data leaderboard.';
+  return rows.map((row, index) => `**${index + 1}.** <@${row.userId}> • Earned **${money(row.stats.earned)}** • Caught **${Number(row.stats.caught || 0).toLocaleString()}**`).join('\n');
+}
 
 export default {
-    data: new SlashCommandBuilder()
-        .setName('fish')
-        .setDescription('Go fishing to catch fish and earn money'),
+  data: new SlashCommandBuilder()
+    .setName('fish')
+    .setDescription('Fishing game with inventory, dynamic prices, rod upgrades, and leaderboard')
+    .addSubcommand(sub => sub.setName('cast').setDescription('Cast your fishing rod and catch fish'))
+    .addSubcommand(sub => sub.setName('bag').setDescription('View your fish inventory'))
+    .addSubcommand(sub => sub.setName('sell').setDescription('Sell all fish to the server dynamic market'))
+    .addSubcommand(sub => sub.setName('shop').setDescription('View fish market prices and fishing upgrade info'))
+    .addSubcommand(sub => sub
+      .setName('buybait')
+      .setDescription('Buy bait for fishing')
+      .addIntegerOption(option => option.setName('amount').setDescription('Bait amount').setRequired(true).setMinValue(1).setMaxValue(200)))
+    .addSubcommand(sub => sub.setName('upgrade').setDescription('Upgrade your fishing rod'))
+    .addSubcommand(sub => sub.setName('leaderboard').setDescription('View fishing leaderboard')),
 
-    execute: withErrorHandling(async (interaction, config, client) => {
-        const deferred = await InteractionHelper.safeDefer(interaction);
-        if (!deferred) return;
-            
-            const userId = interaction.user.id;
-            const guildId = interaction.guildId;
-            const now = Date.now();
+  async execute(interaction, config, client) {
+    const deferred = await InteractionHelper.safeDefer(interaction, {});
+    if (!deferred) return;
 
-            const userData = await getEconomyData(client, guildId, userId);
-            const lastFish = userData.lastFish || 0;
-            const hasFishingRod = userData.inventory["fishing_rod"] || 0;
+    const guildId = interaction.guildId;
+    const userId = interaction.user.id;
+    const sub = interaction.options.getSubcommand();
 
-            if (now < lastFish + FISH_COOLDOWN) {
-                const remaining = lastFish + FISH_COOLDOWN - now;
-                const hours = Math.floor(remaining / (1000 * 60 * 60));
-                const minutes = Math.floor(
-                    (remaining % (1000 * 60 * 60)) / (1000 * 60),
-                );
+    try {
+      if (sub === 'cast') {
+        const result = await GamePackService.fishCast(client, guildId, userId);
+        if (!result.success) return replyError(interaction, result.message);
+        const embed = createEmbed({
+          title: `${result.caught.emoji} Fishing Catch!`,
+          description: `Kamu menangkap **${result.caught.name} x${result.amount}**.\nRarity: **${result.caught.rarity}**\n\nJual ikanmu lewat **/fish sell** atau cek bag lewat **/fish bag**.`,
+          color: result.caught.rarity === 'Legendary' ? 'warning' : result.caught.rarity === 'Epic' ? 'primary' : 'success',
+          image: 'attachment://fish-catch.svg',
+          fields: [
+            { name: '🎣 Rod', value: `Lv.${result.data.rodLevel}`, inline: true },
+            { name: '🪱 Bait', value: `${result.data.bait}`, inline: true },
+            { name: '🐟 Total Caught', value: `${Number(result.data.stats.caught || 0).toLocaleString()}`, inline: true },
+          ]
+        });
+        return InteractionHelper.safeEditReply(interaction, { embeds: [embed], files: [result.visual] });
+      }
 
-                throw createError(
-                    "Fishing cooldown active",
-                    ErrorTypes.RATE_LIMIT,
-                    `You're too tired to fish right now. Rest for **${hours}h ${minutes}m** before fishing again.`,
-                    { remaining, cooldownType: 'fish' }
-                );
-            }
+      if (sub === 'bag') {
+        const result = await GamePackService.fishBag(client, guildId, userId);
+        const embed = createEmbed({
+          title: '🎒 Fish Bag',
+          description: result.text,
+          color: 'info',
+          fields: [
+            { name: '🎣 Rod Level', value: `${result.data.rodLevel}`, inline: true },
+            { name: '🪱 Bait', value: `${result.data.bait}`, inline: true },
+            { name: '💰 Total Earned', value: money(result.data.stats.earned || 0), inline: true },
+          ]
+        });
+        return InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
+      }
 
-            
-            const rand = Math.random();
-            let fishCaught;
-            
-            if (rand < 0.5) {
-                
-                fishCaught = FISH_TYPES.filter(f => f.rarity === 'common')[Math.floor(Math.random() * 3)];
-            } else if (rand < 0.75) {
-                
-                fishCaught = FISH_TYPES.filter(f => f.rarity === 'uncommon')[Math.floor(Math.random() * 2)];
-            } else if (rand < 0.9) {
-                
-                fishCaught = FISH_TYPES.filter(f => f.rarity === 'rare')[Math.floor(Math.random() * 2)];
-            } else if (rand < 0.98) {
-                
-                fishCaught = FISH_TYPES.find(f => f.rarity === 'epic');
-            } else {
-                
-                fishCaught = FISH_TYPES.find(f => f.rarity === 'legendary');
-            }
+      if (sub === 'sell') {
+        const result = await GamePackService.fishSell(client, guildId, userId);
+        if (!result.success) return replyError(interaction, result.message);
+        const lines = result.sold.map(s => `${s.item.emoji} **${s.item.name}** x${s.amount} • ${money(s.price)} each`).join('\n');
+        return InteractionHelper.safeEditReply(interaction, { embeds: [successEmbed(`${lines}\n\nTotal hasil penjualan: **${money(result.total)}**`, '🐟 Fish Sold')] });
+      }
 
-            const baseEarned = Math.floor(
-                Math.random() * (BASE_MAX_REWARD - BASE_MIN_REWARD + 1)
-            ) + BASE_MIN_REWARD;
+      if (sub === 'shop') {
+        const embed = createEmbed({
+          title: '🎣 Fishing Shop & Server Market',
+          description: `${GamePackService.fishPricesText()}\n\n🪱 Bait price: **$75** each\n🎣 Rod upgrade: harga naik setiap level, max Lv.10\nHarga server berubah tiap ±6 jam.`,
+          color: 'primary'
+        });
+        return InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
+      }
 
-            let finalEarned = baseEarned;
-            let multiplierMessage = "";
+      if (sub === 'buybait') {
+        const amount = interaction.options.getInteger('amount', true);
+        const result = await GamePackService.fishBuyBait(client, guildId, userId, amount);
+        if (!result.success) return replyError(interaction, result.message);
+        return InteractionHelper.safeEditReply(interaction, { embeds: [successEmbed(`Kamu membeli **${result.qty} bait** seharga **${money(result.cost)}**. Total bait sekarang: **${result.data.bait}**.`, '🪱 Bait Purchased')] });
+      }
 
-            
-            if (hasFishingRod > 0) {
-                finalEarned = Math.floor(baseEarned * FISHING_ROD_MULTIPLIER);
-                multiplierMessage = `\n🎣 **Fishing Rod Bonus: +50%**`;
-            }
+      if (sub === 'upgrade') {
+        const result = await GamePackService.fishUpgrade(client, guildId, userId);
+        if (!result.success) return replyError(interaction, result.message);
+        return InteractionHelper.safeEditReply(interaction, { embeds: [successEmbed(`Fishing rod kamu naik ke **Lv.${result.data.rodLevel}**. Biaya: **${money(result.cost)}**.`, '🎣 Rod Upgraded')] });
+      }
 
-            const catchMessage = CATCH_MESSAGES[Math.floor(Math.random() * CATCH_MESSAGES.length)];
+      if (sub === 'leaderboard') {
+        const rows = await GamePackService.fishLeaderboard(client, guildId);
+        const embed = createEmbed({ title: '🏆 Fishing Leaderboard', description: leaderboardText(rows), color: 'warning' });
+        return InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
+      }
 
-            userData.wallet += finalEarned;
-            userData.lastFish = now;
-
-            await setEconomyData(client, guildId, userId, userData);
-
-            const rarityColors = {
-                common: '#95A5A6',
-                uncommon: '#2ECC71',
-                rare: '#3498DB',
-                epic: '#9B59B6',
-                legendary: '#F1C40F'
-            };
-
-            const embed = createEmbed({
-                title: '🎣 Fishing Success!',
-                description: `${catchMessage}\n\nYou caught a **${fishCaught.emoji} ${fishCaught.name}**! You sold it for **$${finalEarned.toLocaleString()}**!${multiplierMessage}`,
-                color: rarityColors[fishCaught.rarity]
-            })
-                .addFields(
-                    {
-                        name: "💵 New Cash Balance",
-                        value: `$${userData.wallet.toLocaleString()}`,
-                        inline: true,
-                    },
-                    {
-                        name: "🐟 Rarity",
-                        value: fishCaught.rarity.charAt(0).toUpperCase() + fishCaught.rarity.slice(1),
-                        inline: true,
-                    }
-                )
-                .setFooter({ text: `Next fishing trip available in 45 minutes.` });
-
-            await InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
-    }, { command: 'fish' })
+      return replyError(interaction, 'Subcommand fish tidak dikenal.');
+    } catch (error) {
+      logger.error('fish command error:', error);
+      return replyError(interaction, 'Terjadi error saat menjalankan fishing game.');
+    }
+  }
 };
