@@ -14,7 +14,7 @@ const __dirname = path.dirname(__filename);
 // like /welcome, /goodbye, and /verification are always registered.
 // Override from .env if needed, example:
 // DISABLED_COMMANDS=greet,slut,overview
-const DEFAULT_DISABLED_COMMANDS = ['greet', 'slut'];
+const DEFAULT_DISABLED_COMMANDS = ['greet', 'slut', 'music'];
 
 function getDisabledCommands() {
     const raw = process.env.DISABLED_COMMANDS;
